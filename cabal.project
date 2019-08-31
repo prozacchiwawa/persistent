@@ -1,11 +1,19 @@
+source-repository-package
+  type: git
+  location: git://github.com/prozacchiwawa/generic-deriving.git
+  branch: master
+
+source-repository-package
+  type: git
+  location: git://github.com/prozacchiwawa/transformers-compat.git
+  branch: master
+
+source-repository-package
+  type: git
+  location: git://github.com/prozacchiwawa/base-compat.git
+  branch: only-base-compat
+
 packages:
   persistent
   persistent-template
-  persistent-sqlite
-  persistent-test
-  persistent-mongoDB
-  persistent-mysql
-  persistent-postgresql
-  persistent-redis
   persistent-qq
-

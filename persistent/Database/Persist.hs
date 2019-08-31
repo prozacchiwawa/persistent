@@ -44,7 +44,7 @@ module Database.Persist
     ) where
 
 import Data.Aeson (toJSON, ToJSON)
-import Data.Aeson.Text (encodeToTextBuilder)
+import Data.Aeson.Encode (encodeToTextBuilder)
 import qualified Data.Text as T
 import Data.Text.Lazy (toStrict)
 import Data.Text.Lazy.Builder (toLazyText)

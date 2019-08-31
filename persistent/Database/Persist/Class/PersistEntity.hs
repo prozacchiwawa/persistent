@@ -25,7 +25,7 @@ module Database.Persist.Class.PersistEntity
 import Data.Aeson (ToJSON (..), FromJSON (..), fromJSON, object, (.:), (.=), Value (Object))
 import qualified Data.Aeson.Parser as AP
 import Data.Aeson.Types (Parser,Result(Error,Success))
-import Data.Aeson.Text (encodeToTextBuilder)
+import Data.Aeson.Encode (encodeToTextBuilder)
 import Data.Attoparsec.ByteString (parseOnly)
 import qualified Data.HashMap.Strict as HM
 import Data.Maybe (isJust)
