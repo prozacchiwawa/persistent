@@ -1,7 +1,7 @@
 source-repository-package
   type: git
   location: git://github.com/prozacchiwawa/generic-deriving.git
-  branch: master
+  branch: th-abstraction-downgrade
 
 source-repository-package
   type: git
