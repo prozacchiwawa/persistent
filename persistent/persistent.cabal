@@ -23,10 +23,10 @@ library
         cpp-options: -DNO_OVERLAP
 
     build-depends:   base                     >= 4.11       && < 4.12
-                   , aeson                    >= 0.11.3.0 && <0.11.3.1
-                   , attoparsec               >= 0.13.2.2 && <0.13.2.3
-                   , attoparsec-iso8601       >= 1.0.0.0 && <1.1
-                   , base-compat              >= 0.10.0 && <0.10.1
+                   , aeson                    >= 1.2.4.0 && <1.2.4.1
+                   , attoparsec
+                   , attoparsec-iso8601
+                   , base-compat
                    , base64-bytestring
                    , blaze-html               >= 0.9
                    , bytestring               >= 0.10

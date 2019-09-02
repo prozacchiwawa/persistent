@@ -10,8 +10,18 @@ source-repository-package
 
 source-repository-package
   type: git
-  location: git://github.com/prozacchiwawa/base-compat.git
-  branch: only-base-compat
+  location: git://github.com/prozacchiwawa/aeson.git
+  branch: eta
+
+source-repository-package
+  type: git
+  location: git://github.com/prozacchiwawa/haskell-src-exts.git
+  branch: master
+
+source-repository-package
+  type: git
+  location: git://github.com/prozacchiwawa/haskell-src-meta.git
+  branch: only-haskell-src-meta
 
 packages:
   persistent
