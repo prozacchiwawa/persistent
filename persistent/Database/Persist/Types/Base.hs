@@ -134,7 +134,7 @@ data EntityDef = EntityDef
     , entityExtra   :: !(Map Text [ExtraLine])
     , entitySum     :: !Bool
     -- ^ Whether or not this entity represents a sum type in the database.
-    , entityComments :: !(Maybe Text)
+--    , entityComments :: !(Maybe Text)
     -- ^ Optional comments on the entity.
     --
     -- @since 2.10.0
@@ -198,7 +198,7 @@ data FieldDef = FieldDef
     -- ^ If this is 'True', then the Haskell datatype will have a strict
     -- record field. The default value for this is 'True'.
     , fieldReference :: !ReferenceDef
-    , fieldComments  :: !(Maybe Text)
+--    , fieldComments  :: !(Maybe Text)
     -- ^ Optional comments for a 'Field'. There is not currently a way to
     -- attach comments to a field in the quasiquoter.
     --

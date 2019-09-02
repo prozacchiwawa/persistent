@@ -26,6 +26,7 @@ module Database.Persist.TH
     , mpsPrefixFields
     , mpsEntityJSON
     , mpsGenerateLenses
+    , mpsSlimOutput
     , EntityJSON(..)
     , mkPersistSettings
     , sqlSettings
@@ -264,7 +265,7 @@ data FieldSqlTypeExp = FieldSqlTypeExp FieldDef SqlTypeExp
 
 instance Lift FieldSqlTypeExp where
     lift (FieldSqlTypeExp FieldDef{..} sqlTypeExp) =
-        [|FieldDef fieldHaskell fieldDB fieldType $(lift sqlTypeExp) fieldAttrs fieldStrict fieldReference fieldComments|]
+        [|FieldDef fieldHaskell fieldDB fieldType $(lift sqlTypeExp) fieldAttrs fieldStrict fieldReference|] -- fieldComments
 
 instance Lift EntityDefSqlTypeExp where
     lift (EntityDefSqlTypeExp ent sqlTypeExp sqlTypeExps) =
@@ -391,7 +392,12 @@ mkPersist mps ents' = do
     y <- fmap mconcat $ mapM (mkEntity entityMap mps) ents
     z <- fmap mconcat $ mapM (mkJSON mps) ents
     uniqueKeyInstances <- fmap mconcat $ mapM (mkUniqueKeyInstances mps) ents
-    return $ mconcat [x, y, z, uniqueKeyInstances]
+    return $ mconcat
+      [ x
+      , y
+      , z
+      , uniqueKeyInstances
+      ]
   where
     ents = map fixEntityDef ents'
     entityMap = constructEntityMap ents
@@ -435,6 +441,13 @@ data MkPersistSettings = MkPersistSettings
     -- Default: False
     --
     -- @since 1.3.1
+    , mpsSlimOutput :: !Bool
+    -- ^ Generate output slim enough to be used in eta, despite that some functionality won't
+    -- work.
+    --
+    -- Default: False
+    --
+    -- @since arty
     }
 
 data EntityJSON = EntityJSON
@@ -457,6 +470,7 @@ mkPersistSettings t = MkPersistSettings
         , entityFromJSON = 'entityIdFromJSON
         }
     , mpsGenerateLenses = False
+    , mpsSlimOutput = False
     }
 
 -- | Use the 'SqlPersist' backend.
@@ -1060,9 +1074,10 @@ mkEntity entityMap mps t = do
                     genericDataType mps entName $ mpsBackend mps
             | otherwise = id
 
-    lensClauses <- mkLensClauses mps t
+    lensClauses <- if mpsSlimOutput mps then pure [] else mkLensClauses mps t
 
-    lenses <- mkLenses mps t
+    lenses <- if mpsSlimOutput mps then pure [] else mkLenses mps t
+
     let instanceConstraint = if not (mpsGeneric mps) then [] else
           [mkClassP ''PersistStore [backendT]]
 
@@ -1071,34 +1086,39 @@ mkEntity entityMap mps t = do
        dtd : mconcat fkc `mappend`
       ([ TySynD (keyIdName t) [] $
             ConT ''Key `AppT` ConT (mkName nameS)
-      , instanceD instanceConstraint clazz
-        [ uniqueTypeDec mps t
-        , keyTypeDec
-        , keyToValues'
-        , keyFromValues'
-        , FunD 'entityDef [normalClause [WildP] t']
-        , tpf
-        , FunD 'fromPersistValues fpv
-        , toFieldNames
-        , utv
-        , puk
-        , DataInstD
-            []
-            ''EntityField
-            [ genDataType
-            , VarT $ mkName "typ"
+      , instanceD instanceConstraint clazz $ mconcat
+        [ [ uniqueTypeDec mps t
+          , keyTypeDec
+          , keyToValues'
+          , keyFromValues'
+          , FunD 'entityDef [normalClause [WildP] t']
+          ]
+        , if mpsSlimOutput mps then [] else
+            [ tpf
+            , FunD 'fromPersistValues fpv
+            , toFieldNames
+            , utv
             ]
-            Nothing
-            (map fst fields)
-            []
-        , FunD 'persistFieldDef (map snd fields)
-        , TySynInstD
-            ''PersistEntityBackend
-            (TySynEqn
-               [genDataType]
-               (backendDataType mps))
-        , FunD 'persistIdField [normalClause [] (ConE $ keyIdName t)]
-        , FunD 'fieldLens lensClauses
+        , [ puk
+          , DataInstD
+              []
+              ''EntityField
+              [ genDataType
+              , VarT $ mkName "typ"
+              ]
+              Nothing
+              (map fst fields)
+              []
+          ]
+        , if mpsSlimOutput mps then [] else [ FunD 'persistFieldDef (map snd fields) ]
+        , [ TySynInstD
+              ''PersistEntityBackend
+              (TySynEqn
+                 [genDataType]
+                 (backendDataType mps))
+          , FunD 'persistIdField [normalClause [] (ConE $ keyIdName t)]
+          ]
+      , if mpsSlimOutput mps then [] else [ FunD 'fieldLens lensClauses ]
         ]
       ] `mappend` lenses) `mappend` keyInstanceDecs
   where
@@ -1580,12 +1600,12 @@ liftAndFixKeys entityMap EntityDef{..} =
         entityDerives
         entityExtra
         entitySum
-        entityComments
+--        entityComments
     |]
 
 liftAndFixKey :: EntityMap -> FieldDef -> Q Exp
-liftAndFixKey entityMap (FieldDef a b c sqlTyp e f fieldRef mcomments) =
-    [|FieldDef a b c $(sqlTyp') e f fieldRef' mcomments|]
+liftAndFixKey entityMap (FieldDef a b c sqlTyp e f fieldRef) = -- mcomments
+    [|FieldDef a b c $(sqlTyp') e f fieldRef'|] -- mcomments
   where
     (fieldRef', sqlTyp') = fromMaybe (fieldRef, lift sqlTyp) $
       case fieldRef of
@@ -1610,11 +1630,11 @@ instance Lift EntityDef where
             entityDerives
             entityExtra
             entitySum
-            entityComments
+--            entityComments
             |]
 
 instance Lift FieldDef where
-    lift (FieldDef a b c d e f g h) = [|FieldDef a b c d e f g h|]
+    lift (FieldDef a b c d e f g) = [|FieldDef a b c d e f g|] -- h
 
 instance Lift UniqueDef where
     lift (UniqueDef a b c d) = [|UniqueDef a b c d|]
