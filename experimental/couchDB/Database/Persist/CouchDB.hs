@@ -82,6 +82,7 @@ import qualified Text.JSON
 import Web.PathPieces
 import Web.HttpApiData
 import Network.HTTP.Types.URI
+import Data.Proxy
 
 data IDGAFException = IDGAFException String Value deriving (Show, Eq)
 instance Exception IDGAFException
@@ -111,7 +112,13 @@ instance ToHttpApiData (BackendKey CouchContext) where
   toEncodedUrlPiece (CouchKey k) = toEncodedUrlPiece k
   toHeader (CouchKey k) = toHeader k
   toQueryParam (CouchKey k) = toQueryParam k
-  
+
+instance FromHttpApiData (BackendKey CouchContext) where
+  parseUrlPiece = Right . CouchKey
+  parseQueryParam = Right . CouchKey
+
+instance PersistFieldSql (BackendKey CouchContext) where
+  sqlType _ = sqlType (Proxy :: Proxy Text)
 
 aesonToJSONResult :: Result a -> Text.JSON.Result a
 aesonToJSONResult (Error str) = Text.JSON.Error str
