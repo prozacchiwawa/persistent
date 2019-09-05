@@ -18,6 +18,9 @@ module Database.Persist.CouchDB
     ( module Database.Persist
     , withCouchDBConn
     , CouchContext
+    , aesonToJSONResult
+    , aesonToJSONValue
+    , jsonToAesonValue
     ) where
 
 import Database.Persist
@@ -26,6 +29,7 @@ import Database.Persist.Types
 -- import Database.Persist.Store
 -- import Database.Persist.Query.Internal
 
+import qualified Control.Error.Util as CE
 import Control.Monad
 import Control.Monad.Reader
 import Control.Monad.Trans.Reader hiding (ask)
@@ -162,23 +166,49 @@ instance FromJSON (BackendKey CouchContext) where
   parseJSON (String s) = pure $ CouchKey s
   parseJSON _ = fail "Not a matching type for key"
 
+persistValueFromJSON :: Value -> PersistValue
+persistValueFromJSON Null = PersistNull
+persistValueFromJSON (Bool b) = PersistBool b
+persistValueFromJSON (String s) = PersistText s
+persistValueFromJSON (Number d) = PersistRational $ toRational d
+persistValueFromJSON (Array a) = PersistArray $ persistValueFromJSON <$> Vector.toList a
+persistValueFromJSON (Object o) = PersistMap $ (\(k,v) -> (k, persistValueFromJSON v)) <$> HashMap.toList o
+
+wrapFromPersistValues :: (PersistEntity val) => EntityDef -> PersistValue -> Either Text val
+wrapFromPersistValues e doc = fromPersistValues reorder
+    where clean (PersistMap x) = filter (\(k, _) -> T.head k /= '_' && k /= "id") x
+          reorder = match (map (unDBName . fieldDB) $ (entityFields e)) (clean doc) []
+              where match [] [] values = values
+                    match (c:cs) fields values = let (found, unused) = matchOne fields []
+                                                  in match cs unused (values ++ [snd found])
+                        where matchOne (f:fs) tried = if c == fst f
+                                                         then (f, tried ++ fs)
+                                                         else matchOne fs (f:tried)
+                              matchOne fs tried = error $ "reorder error: field doesn't match 1"
+                                                          ++ (show c) ++ (show fs) ++ (show tried)
+                    match cs fs values = error $ "reorder error: fields don't match 2"
+                                                 ++ (show cs) ++ (show fs) ++ (show values)
+
+couchDBGet :: forall m record . (MonadIO m, PersistRecordBackend record CouchContext) => Key record -> DB.Doc -> ReaderT CouchContext m (Maybe record)
+couchDBGet k doc = do
+  liftIO $ putStrLn $ "key " ++ show k
+  CouchContext {..} <- ask
+  let
+    conn = couchInstanceConn
+    db = couchInstanceDB
+  result :: Maybe (DB.Doc, DB.Rev, Text.JSON.JSValue) <- run conn $ DB.getDoc db doc
+  let
+    outRecord :: Either Text record
+    outRecord =
+      (\(_, _, v) ->
+          wrapFromPersistValues
+            (entityDef $ Just $ dummyFromKey k) $
+            persistValueFromJSON $ jsonToAesonValue v
+      ) =<< CE.note "could not decode as jons" result
+  return $ either (const Nothing) Just outRecord
+
 instance PersistStoreRead CouchContext where
-  get k = do
-    CouchContext {..} <- ask
-    let
-      doc = keyToDoc k
-      conn = couchInstanceConn
-      db = couchInstanceDB
-    result <- run conn $ DB.getDoc db doc
-    return $
-          maybe
-            Nothing
-            (\(_, _, v) ->
-               either
-                 (\e -> error $ "Get error: " ++ T.unpack e)
-                 Just $
-                 wrapFromPersistValues (entityDef $ Just $ dummyFromKey k) v
-            ) result
+  get k = couchDBGet k (keyToDoc k)
   getMany = getMany
 
 instance PersistQueryRead CouchContext where
@@ -212,8 +242,10 @@ couchDBGetBy u = do
     name = viewName names
     design = designName t
   ctx <- ask
+  liftIO $ putStrLn $ "u " ++ show names ++ ":" ++ show values
   x <- runView ctx design name [("key", values)] [DB.ViewMap name $ defaultView t names ""]
-  let justKey = (\(k, v) -> docToKey $ k) =<< maybeHead (x :: [(DB.Doc, PersistValue)])
+  let justKey = (\(k, v) -> docToKey $ k) =<< maybeHead (x :: [(DB.Doc, Value)])
+  liftIO $ putStrLn $ "justKey " ++ show justKey
   case isNothing justKey of
     True -> return Nothing
     False -> do
@@ -252,71 +284,6 @@ uniqueToJSON xs = Array $ Vector.fromList $ fmap toJSON xs
 
 dummyFromUnique :: Unique v -> v
 dummyFromUnique _ = error "dummyFromUnique"
-
-#ifdef hmm
-instance (MonadIO m) => MonadBaseControl b (ReaderT CouchContext m) where
-  newtype StM (ReaderT CouchContext m) a = StMSP {unStMSP :: ComposeSt (ReaderT CouchContext m) a}
-  liftBaseWith = defaultLiftBaseWith StMSP
-  restoreM = defaultRestoreM unStMSP
-#endif
-
-#ifdef persist_has_this_already_now
-instance FromJSON PersistValue where
-    parseJSON (Null) = pure $ PersistNull
-    parseJSON (Bool x) = pure $ PersistBool x
-    parseJSON (Number x) = pure $ PersistDouble $ fromRational x
-    parseJSON (String x) = pure $ PersistText x
-    parseJSON (Array x) = do
-      let
-        (parsedErrors, parsedGood) :: ([String],[PersistValue]) =
-          partitionEithers $ (parseEither parseJSON) <$> Vector.toList x
-      case (parsedErrors, parsedGood) of
-        ([], good) -> PersistList good
-        (errors, _) -> fail $ intercalate ";" errors
-    parseJSON (Object x) =
-      let
-        pairs :: [Either String (Text, PersistValue)] =
-          (\(k,v) ->
-             either
-               (const $ Left (k, Null))
-               (\decval -> Right (k,decval))
-               (parseEither parseJSON v)
-          ) <$> HashMap.fromList x
-        (parsedErrors, parsedGood) = partitionEithers pairs
-      in
-      case (parsedErrors, parsedGood) of
-        ([], good) -> PersistMap $ Map.fromList good
-        (errors, _) -> fail $ intercalate ";" errors
-
-instance ToJSON PersistValue where
-    toJSON (PersistText x) = String . toString $ T.unpack x
-    toJSON (PersistByteString x) = String . toString $ B.unpack x
-    toJSON (PersistInt64 x) = Number $ fromIntegral x
-    toJSON (PersistDouble x) = Number $ toRational x
-    toJSON (PersistBool x) = Bool x
-    toJSON (PersistDay x) = String . toString $ show x
-    toJSON (PersistTimeOfDay x) = String . toString $ show x
-    toJSON (PersistUTCTime x) = String . toString $ show x
-    toJSON (PersistNull) = Null
-    toJSON (PersistList x) = Array $ map toJSON x
-    toJSON (PersistMap x) = Object $ HashMap.fromList $ map (\(k, v) -> (T.unpack k, toJSON v)) x
-    toJSON (PersistObjectId _) = error "PersistObjectId is not supported."
-#endif
-
-wrapFromPersistValues :: (PersistEntity val) => EntityDef -> PersistValue -> Either Text val
-wrapFromPersistValues e doc = fromPersistValues reorder
-    where clean (PersistMap x) = filter (\(k, _) -> T.head k /= '_') x
-          reorder = match (map (unDBName . fieldDB) $ (entityFields e)) (clean doc) []
-              where match [] [] values = values
-                    match (c:cs) fields values = let (found, unused) = matchOne fields []
-                                                  in match cs unused (values ++ [snd found])
-                        where matchOne (f:fs) tried = if c == fst f
-                                                         then (f, tried ++ fs)
-                                                         else matchOne fs (f:tried)
-                              matchOne fs tried = error $ "reorder error: field doesn't match"
-                                                          ++ (show c) ++ (show fs) ++ (show tried)
-                    match cs fs values = error $ "reorder error: fields don't match"
-                                                 ++ (show cs) ++ (show fs) ++ (show values)
 
 entityToJSON :: forall record. (PersistEntity record, PersistEntityBackend record ~ CouchContext) => record -> Value
 entityToJSON x = Object $ HashMap.fromList $ zip names values
@@ -444,6 +411,9 @@ keyToDoc
 keyToDoc key =
   case keyToValues key of
     [PersistText val] -> DB.doc $ T.unpack val
+    [PersistByteString val] -> DB.doc $ T.unpack $ decodeUtf8 val
+    [PersistObjectId val] -> DB.doc $ T.unpack $ decodeUtf8 val
+    [PersistDbSpecific val] -> DB.doc $ T.unpack $ decodeUtf8 val
     values -> DB.doc $ showDigest $ sha1 $ encode values
 
 dummyFromKey :: Key v -> v
@@ -509,7 +479,7 @@ instance (MonadIO m) => PersistStore CouchReader m where
         (conn, db) <- CouchReader ask
         result <- run conn $ DB.getDoc db doc
         return $ maybe Nothing (\(_, _, v) -> either (\e -> error $ "Get error: " ++ T.unpack e) Just $
-                                              wrapFromPersistValues (entityDef $ dummyFromKey k) v) result
+                                              (entityDef $ dummyFromKey k) v)
 
 instance (MonadIO m) => PersistUnique CouchReader m where
     getBy u = do

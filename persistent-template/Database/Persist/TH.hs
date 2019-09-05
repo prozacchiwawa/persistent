@@ -26,6 +26,7 @@ module Database.Persist.TH
     , mpsPrefixFields
     , mpsEntityJSON
     , mpsGenerateLenses
+    , mpsGenerateFields
     , mpsSlimOutput
     , EntityJSON(..)
     , mkPersistSettings
@@ -448,6 +449,7 @@ data MkPersistSettings = MkPersistSettings
     -- Default: False
     --
     -- @since arty
+    , mpsGenerateFields :: !Bool
     }
 
 data EntityJSON = EntityJSON
@@ -471,6 +473,7 @@ mkPersistSettings t = MkPersistSettings
         }
     , mpsGenerateLenses = False
     , mpsSlimOutput = False
+    , mpsGenerateFields = False
     }
 
 -- | Use the 'SqlPersist' backend.
@@ -1001,9 +1004,8 @@ headNote = \case
 
 fromValues :: EntityDef -> Text -> Exp -> [FieldDef] -> Q [Clause]
 fromValues t funName conE fields = do
-    x <- newName "x"
-    let funMsg = entityText t `mappend` ": " `mappend` funName `mappend` " failed on: "
-    patternMatchFailure <- [|Left $ mappend funMsg (pack $ show $(return $ VarE x))|]
+    x <- pure $ mkName "x"
+    patternMatchFailure <- [|Left mempty|] -- mappend funMsg (pack $ show $(return $ VarE x))|]
     suc <- patternSuccess
     return [ suc, normalClause [VarP x] patternMatchFailure ]
   where
@@ -1013,8 +1015,8 @@ fromValues t funName conE fields = do
                 rightE <- [|Right|]
                 return $ normalClause [ListP []] (rightE `AppE` conE)
             _ -> do
-                x1 <- newName "x1"
-                restNames <- mapM (\i -> newName $ "x" `mappend` show i) [2..length fields]
+                x1 <- pure $ mkName "x1"
+                restNames <- mapM (\i -> pure $ mkName $ "x" `mappend` show i) [2..length fields]
                 (fpv1:mkPersistValues) <- mapM mkPersistValue fields
                 app1E <- [|(<$>)|]
                 let conApp = infixFromPersistValue app1E fpv1 conE x1
@@ -1032,7 +1034,8 @@ fromValues t funName conE fields = do
         [|mapLeft (fieldError t field) . fromPersistValue|]
 
 fieldError :: EntityDef -> FieldDef -> Text -> Text
-fieldError entity field err = mconcat
+fieldError entity field err = mempty
+{- XXX
     [ "Couldn't parse field `"
     , fieldName
     , "` from table `"
@@ -1046,6 +1049,7 @@ fieldError entity field err = mconcat
 
     tableName =
         unDBName (entityDB entity)
+-}
 
 mkEntity :: EntityMap -> MkPersistSettings -> EntityDef -> Q [Dec]
 mkEntity entityMap mps t = do
@@ -1085,42 +1089,40 @@ mkEntity entityMap mps t = do
     return $ addSyn $
        dtd : mconcat fkc `mappend`
       ([ TySynD (keyIdName t) [] $
-            ConT ''Key `AppT` ConT (mkName nameS)
-      , instanceD instanceConstraint clazz $ mconcat
-        [ [ uniqueTypeDec mps t
-          , keyTypeDec
-          , keyToValues'
-          , keyFromValues'
-          , FunD 'entityDef [normalClause [WildP] t']
-          ]
-        , if mpsSlimOutput mps then [] else
-            [ tpf
-            , FunD 'fromPersistValues fpv
-            , toFieldNames
-            , utv
-            ]
-        , [ puk
-          , DataInstD
-              []
-              ''EntityField
-              [ genDataType
-              , VarT $ mkName "typ"
-              ]
-              Nothing
-              (map fst fields)
-              []
-          ]
-        , if mpsSlimOutput mps then [] else [ FunD 'persistFieldDef (map snd fields) ]
-        , [ TySynInstD
-              ''PersistEntityBackend
-              (TySynEqn
-                 [genDataType]
-                 (backendDataType mps))
-          , FunD 'persistIdField [normalClause [] (ConE $ keyIdName t)]
-          ]
-      , if mpsSlimOutput mps then [] else [ FunD 'fieldLens lensClauses ]
-        ]
-      ] `mappend` lenses) `mappend` keyInstanceDecs
+         ConT ''Key `AppT` ConT (mkName nameS)
+       , instanceD instanceConstraint clazz $ mconcat $
+         [ [ uniqueTypeDec mps t
+           , keyTypeDec
+           , keyToValues'
+           , keyFromValues'
+           , FunD 'entityDef [normalClause [WildP] t']
+           , toFieldNames
+           , FunD 'fromPersistValues fpv
+           , tpf
+           , DataInstD
+             []
+             ''EntityField
+             [ genDataType
+             , VarT $ mkName "typ"
+             ]
+             Nothing
+             (map fst fields)
+             []
+           , FunD 'persistFieldDef (map snd fields)
+           , TySynInstD
+             ''PersistEntityBackend
+             (TySynEqn
+               [genDataType]
+               (backendDataType mps))
+           , FunD 'persistIdField [normalClause [] (ConE $ keyIdName t)]
+           ]
+         , if mpsSlimOutput mps then [] else
+             [ utv
+             , puk
+             , FunD 'fieldLens lensClauses
+             ]
+         ]
+       ] `mappend` lenses) `mappend` keyInstanceDecs
   where
     genDataType = genericDataType mps entName backendT
     entName = entityHaskell t

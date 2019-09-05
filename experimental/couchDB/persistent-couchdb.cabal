@@ -44,5 +44,6 @@ library
                    , path-pieces
                    , http-api-data
                    , http-types
+                   , errors
     exposed-modules: Database.Persist.CouchDB
     ghc-options:     -Wall
