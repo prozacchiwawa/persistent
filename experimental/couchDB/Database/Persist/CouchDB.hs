@@ -49,13 +49,17 @@ import Control.Comonad.Env hiding (ask)
 import Control.Monad.Catch
 import Control.Monad.IO.Unlift
 
+import Data.Acquire
 import Data.Aeson
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString as BS
 import Data.Char
+import Data.Conduit
+import qualified Data.Conduit.List as ConduitList
 import Data.Either
-import Data.List (intercalate, nub) -- , nubBy)
+import Data.List (intercalate, nub, nubBy, uncons)
 import Data.Pool
+import Data.Ratio
 import Data.Maybe
 import qualified Data.Map as Map
 import Data.Map (Map)
@@ -124,6 +128,12 @@ instance FromHttpApiData (BackendKey CouchContext) where
 instance PersistFieldSql (BackendKey CouchContext) where
   sqlType _ = sqlType (Proxy :: Proxy Text)
 
+-- Actually tried pulling in Data.Either.Extra but doesn't appear to contain mapLeft with the
+-- package set we have
+mapLeft :: forall a b c . (a -> b) -> Either a c -> Either b c
+mapLeft f (Left a) = Left (f a)
+mapLeft f (Right x) = Right x
+
 aesonToJSONResult :: Result a -> Text.JSON.Result a
 aesonToJSONResult (Error str) = Text.JSON.Error str
 aesonToJSONResult (Success a) = Text.JSON.Ok a
@@ -166,53 +176,230 @@ instance FromJSON (BackendKey CouchContext) where
   parseJSON (String s) = pure $ CouchKey s
   parseJSON _ = fail "Not a matching type for key"
 
-persistValueFromJSON :: Value -> PersistValue
-persistValueFromJSON Null = PersistNull
-persistValueFromJSON (Bool b) = PersistBool b
-persistValueFromJSON (String s) = PersistText s
-persistValueFromJSON (Number d) = PersistRational $ toRational d
-persistValueFromJSON (Array a) = PersistArray $ persistValueFromJSON <$> Vector.toList a
-persistValueFromJSON (Object o) = PersistMap $ (\(k,v) -> (k, persistValueFromJSON v)) <$> HashMap.toList o
+getSchemaFromObject :: Value -> String
+getSchemaFromObject (Object o) =
+  case HashMap.lookup "$schema" o of
+    Just (String s) -> T.unpack s
+    _ -> ""
 
-wrapFromPersistValues :: (PersistEntity val) => EntityDef -> PersistValue -> Either Text val
-wrapFromPersistValues e doc = fromPersistValues reorder
-    where clean (PersistMap x) = filter (\(k, _) -> T.head k /= '_' && k /= "id") x
-          reorder = match (map (unDBName . fieldDB) $ (entityFields e)) (clean doc) []
-              where match [] [] values = values
-                    match (c:cs) fields values = let (found, unused) = matchOne fields []
-                                                  in match cs unused (values ++ [snd found])
-                        where matchOne (f:fs) tried = if c == fst f
-                                                         then (f, tried ++ fs)
-                                                         else matchOne fs (f:tried)
-                              matchOne fs tried = error $ "reorder error: field doesn't match 1"
-                                                          ++ (show c) ++ (show fs) ++ (show tried)
-                    match cs fs values = error $ "reorder error: fields don't match 2"
-                                                 ++ (show cs) ++ (show fs) ++ (show values)
+placeSchemaLetter letter (k,fld) =
+  let
+    newFld =
+      case (letter,fld) of
+        (_,String s) -> String $ T.pack $ [letter] ++ T.unpack s
+        ('r',Number v) ->
+          let
+            rat :: Rational = toRational v
+          in
+          String $ T.pack $ "r" ++ (show $ numerator rat) ++ "%" ++ (show $ denominator rat)
+        (_,v) -> v
+  in
+  (k,newFld)
 
-couchDBGet :: forall m record . (MonadIO m, PersistRecordBackend record CouchContext) => Key record -> DB.Doc -> ReaderT CouchContext m (Maybe record)
-couchDBGet k doc = do
+getSchemaLetter :: PersistValue -> Char
+getSchemaLetter (PersistText _) = 's'
+getSchemaLetter (PersistByteString _) = 'b'
+getSchemaLetter (PersistInt64 _) = 'i'
+getSchemaLetter (PersistDouble _) = 'd'
+getSchemaLetter (PersistRational _) = 'r'
+getSchemaLetter (PersistBool _) = 'b'
+getSchemaLetter (PersistTimeOfDay _) = 't'
+getSchemaLetter (PersistUTCTime _) = 'u'
+getSchemaLetter PersistNull = '!'
+getSchemaLetter (PersistList _) = '#'
+getSchemaLetter (PersistMap _) = '%'
+getSchemaLetter (PersistObjectId _) = 'o'
+getSchemaLetter (PersistDbSpecific _) = 'p'
+
+makeSchemaString :: [PersistValue] -> String
+makeSchemaString pv = getSchemaLetter <$> pv
+
+rehydrate :: String -> [(Text,Value)] -> Either Text [(Text,PersistValue)]
+rehydrate schema vs =
+  let
+    (errors,good) = partitionEithers $ convertItem <$> uncurry placeSchemaLetter <$> zip schema vs
+  in
+  case (errors,good) of
+    ([], good) -> Right good
+    (errors, _) -> Left $ T.pack $ intercalate ";" $ errors
+  where
+    convertItem (k,v) =
+      let
+        converted = parseEither parseJSON v
+      in
+      (\cvt -> (k,cvt)) <$> converted
+
+wrapFromValues
+  :: EntityDef
+  -> Value
+  -> Either Text [(Text,Value)]
+wrapFromValues e doc = reorder
+    where
+      match :: [Text] -> [(Text, Value)] -> [(Text,Value)] -> Either Text [(Text,Value)]
+      match [] fields values = Right values
+      match (c:cs) fields values =
+        let
+          found = uncons $ filter (\f -> fst f == c) fields
+        in
+        maybe
+          (Left $ T.pack $ "could not find " ++ T.unpack c)
+          (\((_,f),_) -> match cs fields (values ++ [(c,f)]))
+          found
+
+      clean (Object o) = filter (\(k, _) -> T.head k /= '_' && k /= "id" && k /= "$schema") $ HashMap.toList o
+      reorder = match (map (unDBName . fieldDB) $ (entityFields e)) (clean doc) []
+
+couchDBGet
+  :: forall m record .
+     (MonadIO m, PersistRecordBackend record CouchContext)
+  => CouchContext
+  -> Key record
+  -> DB.Doc
+  -> m (Maybe record)
+couchDBGet CouchContext {..} k doc = do
   liftIO $ putStrLn $ "key " ++ show k
-  CouchContext {..} <- ask
   let
     conn = couchInstanceConn
     db = couchInstanceDB
   result :: Maybe (DB.Doc, DB.Rev, Text.JSON.JSValue) <- run conn $ DB.getDoc db doc
-  let
-    outRecord :: Either Text record
-    outRecord =
-      (\(_, _, v) ->
-          wrapFromPersistValues
-            (entityDef $ Just $ dummyFromKey k) $
-            persistValueFromJSON $ jsonToAesonValue v
-      ) =<< CE.note "could not decode as jons" result
-  return $ either (const Nothing) Just outRecord
+  liftIO $ putStrLn $ "val " ++ show result
+  outRecord <-
+    either
+      (\e -> error e)
+      (\(_, _, v) -> do
+         let
+           edef = entityDef $ Just $ dummyFromKey k
+           toDecode = jsonToAesonValue v
+           schemaString = getSchemaFromObject toDecode
+           fields =
+             case toDecode of
+               Object o -> HashMap.toList o
+               _ -> [("$", toDecode)]
+           unwrappedForDecode = wrapFromValues edef toDecode
+           
+         liftIO $ putStrLn $ "wrapFromValues " ++ show schemaString ++ " " ++ show unwrappedForDecode
+         
+         let
+           aboutTo :: Either Text [(Text,Value)] =
+             (\l -> uncurry placeSchemaLetter <$> zip schemaString l) <$> unwrappedForDecode
+           res :: Either Text [(Text,PersistValue)] =
+             rehydrate schemaString =<< unwrappedForDecode
+
+         liftIO $ putStrLn $ "about to " ++ show aboutTo
+         liftIO $ putStrLn $ "got values " ++ show res
+
+         decoded :: Either Text val <-
+           either
+             (\e -> do
+                 liftIO $ putStrLn $ "failed " ++ T.unpack e
+                 pure $ Left e
+             )
+             (\v -> do
+                 liftIO $ putStrLn $ "wrap ok"
+                 pure $ Right v
+             )
+             (fromPersistValues =<< (\l -> snd <$> l) <$> res)
+
+         pure decoded
+      )
+      (CE.note "could not decode as json" result)
+  either
+    (\e -> do
+        liftIO $ putStrLn $ "nothing!! " ++ T.unpack e
+        pure Nothing
+    )
+    (\rec -> do
+        liftIO $ putStrLn "got a record"
+        pure $ Just rec
+    )
+    outRecord
+--  return $ either (const Nothing) Just outRecord
 
 instance PersistStoreRead CouchContext where
-  get k = couchDBGet k (keyToDoc k)
+  get k = do
+    ctx <- ask
+    couchDBGet ctx k (keyToDoc k)
   getMany = getMany
 
+-- This is not a very effective solution, since it takes the whole input in once. It should be rewritten completely.
+couchDBSelect
+  :: forall m record a .
+     (MonadIO m, PersistRecordBackend record CouchContext)
+  => CouchContext
+  -> [Filter record]
+  -> [(String, Value)]
+  -> [String]
+  -> m [Entity record]
+couchDBSelect ctx f o vals = do
+    let names = filtersToNames f
+        t = entityDef $ Just $ dummyFromFilts f
+        design = designName t
+        filters = viewFilters f $ viewEmit names vals
+        name = uniqueViewName names filters
+    x :: [(DB.Doc, Value)] <- runView ctx design name o [DB.ViewMap name $ defaultView t names filters]
+    liftIO $ putStrLn $ show x
+    y :: [Maybe (Entity record)] <-
+      mapM
+        (\(k,v) -> do
+            let
+              key =
+                case v of
+                  (String s) ->
+                    either (const Nothing) id $
+                      fromPersistValue (PersistDbSpecific $ encodeUtf8 s)
+                  _ -> Nothing
+
+            result :: Maybe (Entity record) <-
+              maybe
+                (pure Nothing)
+                (\k -> do
+                    doc :: Maybe record <- couchDBGet ctx k (keyToDoc k)
+                    pure $ (Entity k) <$> doc
+                )
+                key
+
+            pure result
+        ) x
+
+    return $ catMaybes y
+
+opts :: [SelectOpt a] -> [(String, Value)]
+opts = nubBy (\(x, _) (y, _) -> x == "descending" && x == y) . map o
+    -- The Asc and Desc options should be attribute dependent. Now, they just handle reversing of the output.
+    where o (Asc _) = ("descending", Bool False)
+          o (Desc _) = ("descending", Bool True)
+          o (OffsetBy x) = ("skip", Number $ fromIntegral x)
+          o (LimitTo x) = ("limit", Number $ fromIntegral x)
+
+couchDBSelectSourceRes
+  :: forall m record .
+     (MonadIO m
+     , PersistRecordBackend record CouchContext
+     , PersistEntityBackend record ~ CouchContext
+     )
+  => CouchContext
+  -> [Filter record]
+  -> [SelectOpt record]
+  -> m [Entity record]
+couchDBSelectSourceRes ctx f o = do
+  let
+    entity = entityDef $ Just $ dummyFromFilts f
+
+  couchDBSelect ctx f (opts o) (map (T.unpack . unDBName . fieldDB) $ entityFields entity)
+
 instance PersistQueryRead CouchContext where
-  selectSourceRes filts opts = selectSourceRes filts opts
+  selectSourceRes filts opts = do
+    ctx <- ask
+    let
+      resourceGuardOverConduit =
+        mkAcquire
+          (do
+              results <- couchDBSelectSourceRes ctx filts opts
+              pure $ ConduitList.sourceList results
+          )
+          (const $ pure ())
+    pure resourceGuardOverConduit
+    
   selectFirst filts opts = selectFirst filts opts
   selectKeysRes filts opts = selectKeysRes filts opts
   count = count
@@ -232,16 +419,16 @@ couchDBGetBy
      , PersistRecordBackend record CouchContext
      , PersistEntityBackend record ~ CouchContext
      )
-  => Unique record
-  -> ReaderT CouchContext m (Maybe (Entity record))
-couchDBGetBy u = do
+  => CouchContext
+  -> Unique record
+  -> m (Maybe (Entity record))
+couchDBGetBy ctx u = do
   let
     names = map (T.unpack . unDBName . snd) $ persistUniqueToFieldNames u
     values = uniqueToJSON $ persistUniqueToValues u
     t = entityDef $ Just $ dummyFromUnique u
     name = viewName names
     design = designName t
-  ctx <- ask
   liftIO $ putStrLn $ "u " ++ show names ++ ":" ++ show values
   x <- runView ctx design name [("key", values)] [DB.ViewMap name $ defaultView t names ""]
   let justKey = (\(k, v) -> docToKey $ k) =<< maybeHead (x :: [(DB.Doc, Value)])
@@ -250,11 +437,13 @@ couchDBGetBy u = do
     True -> return Nothing
     False -> do
       let key = fromJust justKey
-      y <- get key
+      y <- couchDBGet ctx key (keyToDoc key)
       return $ fmap (\v -> Entity key v) y
 
 instance PersistUniqueRead CouchContext where
-  getBy = couchDBGetBy
+  getBy k = do
+    ctx <- ask
+    couchDBGetBy ctx k
 
 instance PersistStoreWrite CouchContext where
   insert = insert
@@ -324,9 +513,12 @@ defaultView t names extra = viewBody . viewConstraints (map (T.unpack . unDBName
 viewBody :: String -> String
 viewBody x = "(function (doc) {" ++ x ++ "})"
 
+isNotUndefined :: String -> String
+isNotUndefined x = x ++ " !== undefined"
+
 viewConstraints :: [String] -> String -> String
 viewConstraints [] y = y
-viewConstraints xs y = "if (" ++ (intercalate " && " $ map ("doc."++) xs) ++ ") {" ++ y ++ "}"
+viewConstraints xs y = "if (" ++ (intercalate " && " $ map ("doc."++) $ isNotUndefined <$> xs) ++ ") {" ++ y ++ "}"
 
 viewEmit :: [String] -> [String] -> String
 viewEmit [] _ = viewEmit ["_id"] []
@@ -435,31 +627,6 @@ modify f k v = do
     _ <- run conn $ DB.getAndUpdateDoc db doc (f v)
     return ()
 
-{-
-opts :: [SelectOpt a] -> [(String, Value)]
-opts = nubBy (\(x, _) (y, _) -> x == "descending" && x == y) . map o
-    -- The Asc and Desc options should be attribute dependent. Now, they just handle reversing of the output.
-    where o (Asc _) = ("descending", JSBool False)
-          o (Desc _) = ("descending", JSBool True)
-          o (OffsetBy x) = ("skip", JSRational False $ fromIntegral x)
-          o (LimitTo x) = ("limit", JSRational False $ fromIntegral x)
--}
-
--- This is not a very effective solution, since it takes the whole input in once. It should be rewritten completely.
-{-
-select :: (PersistEntity val, MonadIO m) => [Filter val] -> [(String, Value)]
-    -> Step a' (CouchReader m) b -> [String] -> ((DB.Doc, PersistValue) -> a') -> Iteratee a' (CouchReader m) b
-select f o (Continue k) vals process = do
-    let names = filtersToNames f
-        t = entityDef $ dummyFromFilts f
-        design = designName t
-        filters = viewFilters f $ viewEmit names vals
-        name = uniqueViewName names filters
-    (conn, db) <- lift $ CouchReader ask
-    x <- runView conn db design name o [DB.ViewMap name $ defaultView t names filters]
-    returnI $$ k . Chunks $ map process x
--}
-
 instance (MonadIO m) => PersistStore CouchReader m where
     insert v = do
         (conn, db) <- CouchReader ask
@@ -489,7 +656,7 @@ instance (MonadIO m) => PersistUnique CouchReader m where
             name = viewName names
             design = designName t
         (conn, db) <- CouchReader ask
-        x <- runView conn db design name [("key", values)] [DB.ViewMap name $ defaultView t names ""]
+        x <- runView conn design name [("key", values)] [DB.ViewMap name $ defaultView t names ""]
         let justKey = fmap (\(k, _) -> docToKey k) $ maybeHead (x :: [(DB.Doc, PersistValue)])
         if isNothing justKey
            then return Nothing
