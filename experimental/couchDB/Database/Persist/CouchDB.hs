@@ -21,6 +21,8 @@ module Database.Persist.CouchDB
     , aesonToJSONResult
     , aesonToJSONValue
     , jsonToAesonValue
+    , docToKey
+    , keyToDoc
     ) where
 
 import Database.Persist
@@ -53,6 +55,7 @@ import Data.Acquire
 import Data.Aeson
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base64 as B64
 import Data.Char
 import Data.Conduit
 import qualified Data.Conduit.List as ConduitList
@@ -77,6 +80,8 @@ import Data.Time.Clock
 -- import Data.Enumerator (Stream (..), Step (..), Iteratee (..), returnI, run_, ($$))
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.UUID (UUID)
+import qualified Data.UUID as UUID
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as BL
 -- import qualified Data.Enumerator.List as EL
@@ -91,6 +96,7 @@ import Web.PathPieces
 import Web.HttpApiData
 import Network.HTTP.Types.URI
 import Data.Proxy
+import System.Random
 
 data IDGAFException = IDGAFException String Value deriving (Show, Eq)
 instance Exception IDGAFException
@@ -203,6 +209,7 @@ getSchemaLetter (PersistInt64 _) = 'i'
 getSchemaLetter (PersistDouble _) = 'd'
 getSchemaLetter (PersistRational _) = 'r'
 getSchemaLetter (PersistBool _) = 'b'
+getSchemaLetter (PersistDay _) = 'd'
 getSchemaLetter (PersistTimeOfDay _) = 't'
 getSchemaLetter (PersistUTCTime _) = 'u'
 getSchemaLetter PersistNull = '!'
@@ -213,6 +220,19 @@ getSchemaLetter (PersistDbSpecific _) = 'p'
 
 makeSchemaString :: [PersistValue] -> String
 makeSchemaString pv = getSchemaLetter <$> pv
+
+dehydrate :: PersistValue -> Value
+dehydrate (PersistText t) = String $ t
+dehydrate (PersistByteString bs) = String $ decodeUtf8 $ B64.encode bs
+dehydrate (PersistObjectId i) = String $ decodeUtf8 $ B64.encode i
+dehydrate (PersistDbSpecific s) = String $ decodeUtf8 $ B64.encode s
+dehydrate (PersistRational r) = Number $ fromRational r
+dehydrate (PersistList l) = Array $ Vector.fromList $ dehydrate <$> l
+dehydrate (PersistMap m) = Object $ HashMap.fromList $ (\(k,v) -> (k,dehydrate v)) <$> m
+dehydrate (PersistDay d) = String $ T.pack $ show d
+dehydrate (PersistTimeOfDay t) = String $ T.pack $ show t
+dehydrate (PersistUTCTime d) = String $ T.pack $ show d
+dehydrate p = toJSON p
 
 rehydrate :: String -> [(Text,Value)] -> Either Text [(Text,PersistValue)]
 rehydrate schema vs =
@@ -261,14 +281,16 @@ couchDBGet CouchContext {..} k doc = do
   let
     conn = couchInstanceConn
     db = couchInstanceDB
+    edef = entityDef $ Just $ dummyFromKey k
+    
   result :: Maybe (DB.Doc, DB.Rev, Text.JSON.JSValue) <- run conn $ DB.getDoc db doc
+  liftIO $ putStrLn $ "fields " ++ show edef
   liftIO $ putStrLn $ "val " ++ show result
   outRecord <-
     either
       (\e -> error e)
       (\(_, _, v) -> do
          let
-           edef = entityDef $ Just $ dummyFromKey k
            toDecode = jsonToAesonValue v
            schemaString = getSchemaFromObject toDecode
            fields =
@@ -445,9 +467,66 @@ instance PersistUniqueRead CouchContext where
     ctx <- ask
     couchDBGetBy ctx k
 
+encodeDocumentBody :: forall record. [Text] -> [PersistValue] -> [(Text, PersistValue)]
+encodeDocumentBody fields values =
+  let
+    schema :: (Text, PersistValue) =
+      (T.pack "$schema", PersistText $ T.pack $ makeSchemaString values)
+  in
+  schema : (zip fields values)
+    
+couchDBInsert
+  :: forall m record .
+     ( PersistStoreWrite CouchContext
+     , MonadIO m
+     , PersistRecordBackend record CouchContext
+     , PersistEntityBackend record ~ CouchContext
+     , PersistEntity record
+     )
+  => CouchContext
+  -> record
+  -> m (Key record)
+couchDBInsert ctx@CouchContext {..} record = do
+  uuid :: UUID <- liftIO randomIO
+
+  let
+    theUUIDString :: String = UUID.toString uuid
+    theDoc :: DB.Doc = DB.doc $ theUUIDString
+    uuidAsKey :: Maybe (Key record) = docToKey $ theDoc
+
+  liftIO $ putStrLn $ "uuidAsKey " ++ theUUIDString
+  liftIO $ putStrLn $ "theDoc " ++ show theDoc
+  liftIO $ putStrLn $ "isJust " ++ show (isJust uuidAsKey)
+
+  let
+    key :: Key record = fromJust uuidAsKey
+    edef :: EntityDef = entityDef $ Just $ dummyFromKey key
+    doc = keyToDoc key
+    baseFields = toPersistValue <$> toPersistFields record
+    encodedDocument = encodeDocumentBody ((unDBName . fieldDB) <$> entityFields edef) $ baseFields
+    encodedJson = dehydrate $ PersistMap encodedDocument
+
+  liftIO $ putStrLn $ "baseFields " ++ (show baseFields)
+  
+  docInsertResult :: Either String DB.Rev <-
+    run couchInstanceConn $ DB.newNamedDoc couchInstanceDB doc $ aesonToJSONValue encodedJson
+
+  pure key
+{-
+  let
+    resultKeyEither :: Either String (Key record) = (const key) <$> docInsertResult
+    resultKey :: Key record = fromRight resultKeyEither
+    
+  pure key
+-}
+
 instance PersistStoreWrite CouchContext where
-  insert = insert
-  insert_ = insert_
+  insert record = do
+    ctx <- ask
+    couchDBInsert ctx record
+  insert_ record = do
+    insert record
+    pure ()
   insertMany = insertMany
   insertMany_ = insertMany_
   insertEntityMany = insertEntityMany
@@ -591,7 +670,11 @@ docToKey
      )
   => DB.Doc
   -> Maybe (Key record)
-docToKey doc = either (const Nothing) Just $ keyFromValues [PersistText $ T.pack $ show doc]
+docToKey doc =
+  let
+    body = encodeUtf8 $ T.pack $ show doc
+  in
+  either (const Nothing) Just $ keyFromValues [PersistDbSpecific body]
 
 keyToDoc
   :: forall record .

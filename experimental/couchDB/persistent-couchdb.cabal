@@ -48,5 +48,8 @@ library
                    , conduit
                    , resourcet
                    , extra
+                   , uuid
+                   , random
+                   , base64-bytestring
     exposed-modules: Database.Persist.CouchDB
     ghc-options:     -Wall
