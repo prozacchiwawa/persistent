@@ -424,7 +424,13 @@ instance PersistQueryRead CouchContext where
           (const $ pure ())
     pure resourceGuardOverConduit
     
-  selectFirst filts opts = selectFirst filts opts
+  selectFirst filts opts = do
+    ctx <- ask
+    result <- couchDBSelectSourceRes ctx filts ((LimitTo 1):opts)
+    case result of
+      (res:_) -> pure $ Just res
+      _ -> pure $ Nothing
+      
   selectKeysRes filts opts = selectKeysRes filts opts
   count = count
 
