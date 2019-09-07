@@ -97,6 +97,8 @@ import Web.HttpApiData
 import Network.HTTP.Types.URI
 import Data.Proxy
 import System.Random
+import Text.Read (readEither)
+import Data.Int
 
 data IDGAFException = IDGAFException String Value deriving (Show, Eq)
 instance Exception IDGAFException
@@ -494,12 +496,24 @@ couchDBInsert ctx@CouchContext {..} record = do
     theDoc :: DB.Doc = DB.doc $ theUUIDString
     uuidAsKey :: Maybe (Key record) = docToKey $ theDoc
 
-  liftIO $ putStrLn $ "uuidAsKey " ++ theUUIDString
-  liftIO $ putStrLn $ "theDoc " ++ show theDoc
-  liftIO $ putStrLn $ "isJust " ++ show (isJust uuidAsKey)
+  liftIO $ putStrLn $ "uuidAsKey " ++ show uuidAsKey ++ " from " ++ theUUIDString ++ " via " ++ show theDoc
 
+  couchDBInsertKey ctx (fromJust uuidAsKey) record
+
+couchDBInsertKey
+  :: forall m record .
+     ( PersistStoreWrite CouchContext
+     , MonadIO m
+     , PersistRecordBackend record CouchContext
+     , PersistEntityBackend record ~ CouchContext
+     , PersistEntity record
+     )
+  => CouchContext
+  -> Key record
+  -> record
+  -> m (Key record)
+couchDBInsertKey ctx@CouchContext {..} key record = do
   let
-    key :: Key record = fromJust uuidAsKey
     edef :: EntityDef = entityDef $ Just $ dummyFromKey key
     doc = keyToDoc key
     baseFields = toPersistValue <$> toPersistFields record
@@ -507,6 +521,7 @@ couchDBInsert ctx@CouchContext {..} record = do
     encodedJson = dehydrate $ PersistMap encodedDocument
 
   liftIO $ putStrLn $ "baseFields " ++ (show baseFields)
+  liftIO $ putStrLn $ "encodedJSON " ++ (show encodedJson)
   
   docInsertResult :: Either String DB.Rev <-
     run couchInstanceConn $ DB.newNamedDoc couchInstanceDB doc $ aesonToJSONValue encodedJson
@@ -525,12 +540,15 @@ instance PersistStoreWrite CouchContext where
     ctx <- ask
     couchDBInsert ctx record
   insert_ record = do
-    insert record
+    _ <- insert record
     pure ()
   insertMany = insertMany
   insertMany_ = insertMany_
   insertEntityMany = insertEntityMany
-  insertKey k = insertKey k
+  insertKey k record = do
+    ctx <- ask
+    _ <- couchDBInsertKey ctx k record
+    pure ()
   repsert k = repsert k
   repsertMany = repsertMany
   replace k = replace k
@@ -674,7 +692,18 @@ docToKey doc =
   let
     body = encodeUtf8 $ T.pack $ show doc
   in
-  either (const Nothing) Just $ keyFromValues [PersistDbSpecific body]
+  either
+    (\_ ->
+       let
+         ourInt :: Either Text Int64 = mapLeft T.pack $ readEither $ show body
+       in
+       either
+        (const Nothing)
+        Just $
+        ((keyFromValues . (:[]) . PersistInt64) =<< ourInt)
+    )
+    Just $
+    keyFromValues [PersistDbSpecific body]
 
 keyToDoc
   :: forall record .
