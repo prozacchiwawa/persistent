@@ -434,9 +434,46 @@ instance PersistQueryRead CouchContext where
   selectKeysRes filts opts = selectKeysRes filts opts
   count = count
 
+couchDBDeleteWhere
+  :: forall m record .
+     (MonadIO m
+     , PersistRecordBackend record CouchContext
+     , PersistEntityBackend record ~ CouchContext
+     )
+  => CouchContext
+  -> [Filter record]
+  -> m ()
+couchDBDeleteWhere ctx f = do
+  let
+    entity = entityDef $ Just $ dummyFromFilts f
+    vals = map (T.unpack . unDBName . fieldDB) $ entityFields entity
+    names = filtersToNames f
+    t = entityDef $ Just $ dummyFromFilts f
+    design = designName t
+    filters = viewFilters f $ viewEmit names vals
+    name = uniqueViewName names filters
+    db = couchInstanceDB ctx
+    conn = couchInstanceConn ctx
+        
+  x :: [(DB.Doc, Value)] <- runView ctx design name [] [DB.ViewMap name $ defaultView t names filters]
+  mapM_
+    (\(doc,_) -> run conn $ do
+        result :: Maybe (DB.Doc, DB.Rev, Value) <- DB.getDoc db doc
+        maybe
+          (pure ())
+          (\(_, rev, _) -> do
+              DB.deleteDoc db (doc,rev)
+              pure ()
+          )
+          result
+    )
+    x
+    
 instance PersistQueryWrite CouchContext where
   updateWhere filts updates = updateWhere filts updates
-  deleteWhere = deleteWhere
+  deleteWhere filts = do
+    ctx <- ask
+    couchDBDeleteWhere ctx filts
 
 maybeHead :: [a] -> Maybe a
 maybeHead [] = Nothing
