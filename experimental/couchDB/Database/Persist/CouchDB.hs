@@ -194,6 +194,9 @@ placeSchemaLetter letter (k,fld) =
   let
     newFld =
       case (letter,fld) of
+        ('b',String s) -> String s
+        ('o',String s) -> String s
+        ('p',String s) -> String s
         (_,String s) -> String $ T.pack $ [letter] ++ T.unpack s
         ('r',Number v) ->
           let
@@ -225,9 +228,9 @@ makeSchemaString pv = getSchemaLetter <$> pv
 
 dehydrate :: PersistValue -> Value
 dehydrate (PersistText t) = String $ t
-dehydrate (PersistByteString bs) = String $ decodeUtf8 $ B64.encode bs
-dehydrate (PersistObjectId i) = String $ decodeUtf8 $ B64.encode i
-dehydrate (PersistDbSpecific s) = String $ decodeUtf8 $ B64.encode s
+dehydrate (PersistByteString bs) = String $ (T.pack "b") <> decodeUtf8 (B64.encode bs)
+dehydrate (PersistObjectId i) = String $ (T.pack "o") <> decodeUtf8 (B64.encode i)
+dehydrate (PersistDbSpecific s) = String $ (T.pack "p") <> decodeUtf8 (B64.encode s)
 dehydrate (PersistRational r) = Number $ fromRational r
 dehydrate (PersistList l) = Array $ Vector.fromList $ dehydrate <$> l
 dehydrate (PersistMap m) = Object $ HashMap.fromList $ (\(k,v) -> (k,dehydrate v)) <$> m
