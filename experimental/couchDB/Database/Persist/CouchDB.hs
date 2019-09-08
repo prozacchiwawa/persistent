@@ -97,7 +97,7 @@ import Web.HttpApiData
 import Network.HTTP.Types.URI
 import Data.Proxy
 import System.Random
-import Text.Read (readEither)
+import Text.Read (readEither, readMaybe)
 import Data.Int
 
 data IDGAFException = IDGAFException String Value deriving (Show, Eq)
@@ -366,16 +366,11 @@ couchDBSelect ctx f o vals = do
       mapM
         (\(k,v) -> do
             let
-              key =
-                case v of
-                  (String s) ->
-                    either (const Nothing) id $
-                      fromPersistValue (PersistDbSpecific $ encodeUtf8 s)
-                  _ -> Nothing
+              key = keyFromValues [PersistDbSpecific $ encodeUtf8 $ T.pack $ show k]
 
             result :: Maybe (Entity record) <-
-              maybe
-                (pure Nothing)
+              either
+                (const $ pure Nothing)
                 (\k -> do
                     doc :: Maybe record <- couchDBGet ctx k (keyToDoc k)
                     pure $ (Entity k) <$> doc
@@ -688,9 +683,25 @@ viewFilters filters x = "if (" ++ (intercalate " && " $ map fKind filters) ++ ")
       fKind (Filter field v NotIn) =
         "!(" ++ fKind (Filter field v In) ++ ")"
       fKind (Filter field v op) =
-        "doc." ++ (T.unpack $ unDBName $ fieldDBName field) ++
-        fOp op ++
-        (handleFilter v)
+        let
+          incomingName = unDBName $ fieldDBName field
+        in
+        if incomingName == "id" then
+          case v of
+            FilterValue fv ->
+              let
+                asInteger :: Value = toJSON $ toPersistValue fv
+              in
+              case asInteger of
+                Number n -> "doc._id" ++ fOp op ++ (handleFilter v)
+                String s ->
+                  let
+                    decoded :: BS.ByteString = either (const $ encodeUtf8 s) id (B64.decode $ encodeUtf8 $ T.tail s)
+                  in
+                  "doc._id" ++ fOp op ++ "\"" ++ T.unpack (decodeUtf8 decoded) ++ "\""
+            _ -> "doc." ++ (T.unpack incomingName) ++ fOp op ++ (handleFilter v)
+        else
+          "doc." ++ (T.unpack incomingName) ++ fOp op ++ (handleFilter v)
       fKind (FilterOr fs) = "(" ++ (intercalate " || " $ map fKind fs) ++ ")"
       fKind (FilterAnd fs) = "(" ++ (intercalate " && " $ map fKind fs) ++ ")"
       fOp Eq = " == "
