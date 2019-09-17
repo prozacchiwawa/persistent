@@ -23,6 +23,7 @@ module Database.Persist.CouchDB
     , jsonToAesonValue
     , docToKey
     , keyToDoc
+    , wrapFromValues
     ) where
 
 import Database.Persist
@@ -255,24 +256,30 @@ rehydrate schema vs =
       (\cvt -> (k,cvt)) <$> converted
 
 wrapFromValues
-  :: EntityDef
+  :: Bool
+  -> EntityDef
   -> Value
   -> Either Text [(Text,Value)]
-wrapFromValues e doc = reorder
+wrapFromValues hnames e doc = reorder
     where
-      match :: [Text] -> [(Text, Value)] -> [(Text,Value)] -> Either Text [(Text,Value)]
+      match :: [FieldDef] -> [(Text, Value)] -> [(Text,Value)] -> Either Text [(Text,Value)]
       match [] fields values = Right values
       match (c:cs) fields values =
         let
-          found = uncons $ filter (\f -> fst f == c) fields
+          found = uncons $ filter (\f -> fst f == unDBName (fieldDB c)) fields
         in
         maybe
-          (Left $ T.pack $ "could not find " ++ T.unpack c)
-          (\((_,f),_) -> match cs fields (values ++ [(c,f)]))
+          (Left $ T.pack $ "could not find " ++ T.unpack (unDBName $ fieldDB c))
+          (\((_,f),_) ->
+             let
+               resultName =
+                 if hnames then unHaskellName (fieldHaskell c) else unDBName (fieldDB c)
+             in
+             match cs fields (values ++ [(resultName,f)]))
           found
 
-      clean (Object o) = filter (\(k, _) -> T.head k /= '_' && k /= "id" && k /= "$schema") $ HashMap.toList o
-      reorder = match (map (unDBName . fieldDB) $ (entityFields e)) (clean doc) []
+      clean (Object o) = filter (\(k, _) -> T.head k /= '_' && k /= "$schema") $ HashMap.toList o
+      reorder = match (entityFields e) (clean doc) []
 
 couchDBGet
   :: forall m record .
@@ -302,7 +309,7 @@ couchDBGet CouchContext {..} k doc = do
              case toDecode of
                Object o -> HashMap.toList o
                _ -> [("$", toDecode)]
-           unwrappedForDecode = wrapFromValues edef toDecode
+           unwrappedForDecode = wrapFromValues False edef toDecode
            
          liftIO $ putStrLn $ "wrapFromValues " ++ show schemaString ++ " " ++ show unwrappedForDecode
          
