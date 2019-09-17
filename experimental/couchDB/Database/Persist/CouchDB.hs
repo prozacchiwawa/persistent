@@ -17,7 +17,7 @@
 module Database.Persist.CouchDB
     ( module Database.Persist
     , withCouchDBConn
-    , CouchContext
+    , CouchContext (..)
     , aesonToJSONResult
     , aesonToJSONValue
     , jsonToAesonValue
@@ -517,14 +517,17 @@ instance PersistUniqueRead CouchContext where
     ctx <- ask
     couchDBGetBy ctx k
 
-encodeDocumentBody :: forall record. [Text] -> [PersistValue] -> [(Text, PersistValue)]
-encodeDocumentBody fields values =
+encodeDocumentBody :: forall record. Text -> [Text] -> [PersistValue] -> [(Text, PersistValue)]
+encodeDocumentBody haskellName fields values =
   let
     schema :: (Text, PersistValue) =
       (T.pack "$schema", PersistText $ T.pack $ makeSchemaString values)
+
+    documentType :: (Text, PersistValue) =
+      (T.pack "messageType", PersistText haskellName)
   in
-  schema : (zip fields values)
-    
+  documentType : (schema : (zip fields values))
+
 couchDBInsert
   :: forall m record .
      ( PersistStoreWrite CouchContext
@@ -565,7 +568,7 @@ couchDBInsertKey ctx@CouchContext {..} key record = do
     edef :: EntityDef = entityDef $ Just $ dummyFromKey key
     doc = keyToDoc key
     baseFields = toPersistValue <$> toPersistFields record
-    encodedDocument = encodeDocumentBody ((unDBName . fieldDB) <$> entityFields edef) $ baseFields
+    encodedDocument = encodeDocumentBody (unHaskellName $ entityHaskell edef) ((unDBName . fieldDB) <$> entityFields edef) $ baseFields
     encodedJson = dehydrate $ PersistMap encodedDocument
 
   liftIO $ putStrLn $ "baseFields " ++ (show baseFields)
