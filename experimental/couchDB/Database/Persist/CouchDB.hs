@@ -689,9 +689,9 @@ viewFilters :: (PersistEntity val) => [Filter val] -> String -> String
 viewFilters [] x = x
 viewFilters filters x = "if (" ++ (intercalate " && " $ map fKind filters) ++ ") {" ++ x ++ "}"
     where
-      handleFilter (FilterValue t) = (BL.unpack . encode . toJSON . toPersistValue) t
-      handleFilter (FilterValues t) = (BL.unpack . encode . Array . Vector.fromList . map (toJSON . toPersistValue)) t
-      handleFilter (UnsafeValue u) = (BL.unpack . encode . toJSON . toPersistValue) u
+      handleFilter (FilterValue t) = (BL.unpack . encode . dehydrate . toPersistValue) t
+      handleFilter (FilterValues t) = (BL.unpack . encode . Array . Vector.fromList . map (dehydrate . toPersistValue)) t
+      handleFilter (UnsafeValue u) = (BL.unpack . encode . dehydrate . toPersistValue) u
 
       fKind (Filter field v NotIn) =
         "!(" ++ fKind (Filter field v In) ++ ")"
