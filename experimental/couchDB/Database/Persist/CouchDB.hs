@@ -111,7 +111,7 @@ data CouchContext =
     }
 
 data CouchMonadT m a = CouchMonadT (ReaderT CouchContext m a)
-  
+
 instance HasPersistBackend CouchContext where
   type BaseBackend CouchContext = CouchContext
   persistBackend = id
@@ -428,7 +428,7 @@ instance PersistQueryRead CouchContext where
           )
           (const $ pure ())
     pure resourceGuardOverConduit
-    
+  
   selectFirst filts opts = do
     ctx <- ask
     result <- couchDBSelectSourceRes ctx filts ((LimitTo 1):opts)
@@ -473,7 +473,28 @@ couchDBDeleteWhere ctx f = do
           result
     )
     x
-    
+
+couchDBDelete
+  :: forall m record .
+     ( MonadIO m
+     , PersistRecordBackend record CouchContext
+     , PersistEntityBackend record ~ CouchContext
+     )
+  => CouchContext
+  -> Key record
+  -> m ()
+couchDBDelete CouchContext {..} key = do
+  let
+    doc = keyToDoc key
+    conn = couchInstanceConn
+    db = couchInstanceDB
+  run conn $ do
+    result :: Maybe (DB.Doc, DB.Rev, Value) <- DB.getDoc db doc
+    maybe
+      (pure ())
+      (\(doc,rev,_) -> void $ DB.deleteDoc db (doc, rev))
+      result
+
 instance PersistQueryWrite CouchContext where
   updateWhere filts updates = updateWhere filts updates
   deleteWhere filts = do
@@ -600,10 +621,15 @@ instance PersistStoreWrite CouchContext where
     ctx <- ask
     _ <- couchDBInsertKey ctx k record
     pure ()
-  repsert k = repsert k
+  repsert k record = do
+    ctx <- ask
+    couchDBDelete ctx k
+    void $ couchDBInsertKey ctx k record
   repsertMany = repsertMany
   replace k = replace k
-  delete = delete
+  delete k = do
+    ctx <- ask
+    couchDBDelete ctx k
   update k = update k
   updateGet k = updateGet k
 
@@ -739,7 +765,9 @@ runView CouchContext {..} design name dict views = do
   let
     conn = couchInstanceConn
     db = couchInstanceDB
-    query = run conn $ DB.queryView db design (DB.doc name) $
+    query = do
+      putStrLn $ "runQuery " ++ show design
+      run conn $ DB.queryView db design (DB.doc name) $
             (\(k,v) -> (k,aesonToJSONValue v)) <$> dict
     -- The DB.newView function from the Database.CouchDB v 0.10 module is broken
     -- and fails with the HTTP 409 error when it is called more than once.
@@ -792,142 +820,3 @@ dummyFromKey _ = error "dummyFromKey"
 
 dummyFromFilts :: [Filter v] -> v
 dummyFromFilts _ = error "dummyFromFilts"
-
-#ifdef notyet
-instance MonadTransControl CouchReader where
-    newtype StT CouchReader a = StReader {unStReader :: a}
-    liftWith f = CouchReader . ReaderT $ \r -> f $ \t -> liftM StReader $ runReaderT (unCouchConn t) r
-    restoreT = CouchReader . ReaderT . const . liftM unStReader
-
-modify :: (JSON a, MonadIO m) => (t -> a -> IO a) -> Key backend entity -> t -> CouchReader m ()
-modify f k v = do
-    let doc = keyToDoc k
-    (conn, db) <- CouchReader ask
-    _ <- run conn $ DB.getAndUpdateDoc db doc (f v)
-    return ()
-
-instance (MonadIO m) => PersistStore CouchReader m where
-    insert v = do
-        (conn, db) <- CouchReader ask
-        (doc, _) <- run conn $ DB.newDoc db (entityToJSON v)
-        return $ docToKey doc
-
-    replace = modify $ const . return . entityToJSON
-
-    delete k = do
-        let doc = keyToDoc k
-        (conn, db) <- CouchReader ask
-        _ <- run conn $ DB.forceDeleteDoc db doc
-        return ()
-
-    get k = do
-        let doc = keyToDoc k
-        (conn, db) <- CouchReader ask
-        result <- run conn $ DB.getDoc db doc
-        return $ maybe Nothing (\(_, _, v) -> either (\e -> error $ "Get error: " ++ T.unpack e) Just $
-                                              (entityDef $ dummyFromKey k) v)
-
-instance (MonadIO m) => PersistUnique CouchReader m where
-    getBy u = do
-        let names = map (T.unpack . unDBName . snd) $ persistUniqueToFieldNames u
-            values = uniqueToJSON $ persistUniqueToValues u
-            t = entityDef $ dummyFromUnique u
-            name = viewName names
-            design = designName t
-        (conn, db) <- CouchReader ask
-        x <- runView conn design name [("key", values)] [DB.ViewMap name $ defaultView t names ""]
-        let justKey = fmap (\(k, _) -> docToKey k) $ maybeHead (x :: [(DB.Doc, PersistValue)])
-        if isNothing justKey
-           then return Nothing
-           else do let key = fromJust justKey
-                   y <- get key
-                   return $ fmap (\v -> Entity key v) y
-
-    {-
-    deleteBy u = do
-        mEnt <- getBy u
-        case mEnt of
-          Just (Entity key _) -> delete key
-          Nothing -> return ()
-          -}
-             
-
-fieldName ::  forall record typ.  (PersistEntity record) => EntityField record typ -> Text
-fieldName = unDBName . fieldDB . persistFieldDef
-
-instance PersistQuery CouchReader where
-    update key = modify (\u x -> return $ foldr field x u) key
-        where -- e = entityDef $ dummyFromKey key
-              field (Update updField value up) doc = case up of
-                                                   Assign -> execute doc $ const val
-                                                   Add -> execute doc $ op (+) val
-                                                   Subtract -> execute doc $ op (-) val
-                                                   Multiply -> execute doc $ op (*) val
-                                                   Divide -> execute doc $ op (/) val
-                  where name = fieldName updField
-                        val = toPersistValue value
-                        execute (PersistMap x) g = PersistMap $ map (\(k, v) -> if k == name then (k, g v) else (k, v)) x
-                        op o (PersistInt64 x) (PersistInt64 y) = PersistInt64 . truncate $ (fromIntegral y) `o` (fromIntegral x)
-                        op o (PersistDouble x) (PersistDouble y) = PersistDouble $ y `o` x
-
-    {-
-    updateWhere f u = run_ $ selectKeys f $$ EL.mapM_ (flip update u)
-
-    deleteWhere f = run_ $ selectKeys f $$ EL.mapM_ delete
-    -}
-
-    {-
-    selectSource f o k = let entity = entityDef $ dummyFromFilts f
-                        in select f (opts o) k (map fieldDB $ entityFields entity)
-                                  (\(x, y) -> (docToKey x, either (\e -> error $ "SelectEnum error: " ++ e)
-                                                                  id $ wrapFromPersistValues entity y))
-    -}
-
-    -- selectKeys f k = select f [] k [] (docToKey . fst)
-
-    -- It is more effective to use a MapReduce view with the _count function, but the Database.CouchDB module
-    -- expects the id attribute to be present in the result, which is e.g. {"rows":[{"key":null,"value":10}]}.
-    -- For now, it is possible to write a custom function or to catch the exception and parse the count from it,
-    -- but that is just plain ugly.
-    -- count f = run_ $ selectKeys f $$ EL.fold ((flip . const) (+1)) 0
-
--- | Information required to connect to a CouchDB database.
-data CouchConf = CouchConf
-    { couchDatabase :: String
-    , couchHost     :: String
-    , couchPort     :: Int
-    , couchPoolSize :: Int
-    }
-
-newtype NoOrphanNominalDiffTime = NoOrphanNominalDiffTime NominalDiffTime
-                                deriving (Show, Eq, Num)
-instance FromJSON NoOrphanNominalDiffTime where
-    parseJSON (Number (I x)) = (return . NoOrphanNominalDiffTime . fromInteger) x
-    parseJSON (Number (D x)) = (return . NoOrphanNominalDiffTime . fromRational . toRational) x
-    parseJSON _ = fail "couldn't parse diff time"
-
-instance PersistConfig CouchConf where
-    type PersistConfigBackend CouchConf = CouchReader
-    type PersistConfigPool CouchConf = CouchContext
-    -- createPoolConfig (CouchConf db host port poolsize) = withCouchDBPool db host port poolsize
-    runPool _ = runCouchDBConn
-    loadConfig (Object o) = do
-        db   <- o .: "database"
-        host               <- o .:? "host" .!= "127.0.0.1"
-        port               <- o .:? "port" .!= 5984 -- (PortNumber 5984)
-        pool               <- o .:? "poolsize" .!= 1
-        {-
-        poolStripes        <- o .:? "poolstripes" .!= 1
-        stripeConnections  <- o .:  "connections"
-        -- (NoOrphanNominalDiffTime connectionIdleTime) <- o .:? "connectionIdleTime" .!= 20
-        mUser              <- o .:? "user"
-        mPass              <- o .:? "password"
-        -}
-
-        return $ CouchConf { couchDatabase = T.unpack db
-                           , couchHost = T.unpack host
-                           , couchPort = port
-                           , couchPoolSize = pool
-                           }
-    loadConfig _ = mzero
-#endif
