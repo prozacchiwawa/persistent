@@ -26,6 +26,8 @@ module Database.Persist.CouchDB
     , wrapFromValues
     , getPersistFields
     , doPersistDecode
+    , encodeDocumentBody
+    , dehydrate
     ) where
 
 import Database.Persist
@@ -528,7 +530,7 @@ instance PersistUniqueRead CouchContext where
     ctx <- ask
     couchDBGetBy ctx k
 
-encodeDocumentBody :: forall record. Text -> [Text] -> [PersistValue] -> [(Text, PersistValue)]
+encodeDocumentBody :: Text -> [Text] -> [PersistValue] -> [(Text, PersistValue)]
 encodeDocumentBody haskellName fields values =
   let
     schema :: (Text, PersistValue) =
