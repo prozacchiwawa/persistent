@@ -24,6 +24,10 @@ module Database.Persist.CouchDB
     , docToKey
     , keyToDoc
     , wrapFromValues
+    , getPersistFields
+    , doPersistDecode
+    , encodeDocumentBody
+    , dehydrate
     ) where
 
 import Database.Persist
@@ -281,6 +285,28 @@ wrapFromValues hnames e doc = reorder
       clean (Object o) = filter (\(k, _) -> T.head k /= '_' && k /= "$schema") $ HashMap.toList o
       reorder = match (entityFields e) (clean doc) []
 
+getPersistFields edef toDecode =
+  let
+    schemaString = getSchemaFromObject toDecode
+    fields =
+      case toDecode of
+        Object o -> HashMap.toList o
+        _ -> [("$", toDecode)]
+    unwrappedForDecode = wrapFromValues False edef toDecode
+
+    aboutTo :: Either Text [(Text,Value)] =
+      (\l -> uncurry placeSchemaLetter <$> zip schemaString l) <$> unwrappedForDecode
+    res :: Either Text [(Text,PersistValue)] =
+      rehydrate schemaString =<< unwrappedForDecode
+  in
+  res
+
+doPersistDecode edef toDecode =
+  let
+    res = getPersistFields edef toDecode
+  in
+  fromPersistValues =<< (\l -> snd <$> l) <$> res
+
 couchDBGet
   :: forall m record .
      (MonadIO m, PersistRecordBackend record CouchContext)
@@ -294,48 +320,14 @@ couchDBGet CouchContext {..} k doc = do
     conn = couchInstanceConn
     db = couchInstanceDB
     edef = entityDef $ Just $ dummyFromKey k
-    
+
   result :: Maybe (DB.Doc, DB.Rev, Text.JSON.JSValue) <- run conn $ DB.getDoc db doc
   liftIO $ putStrLn $ "fields " ++ show edef
   liftIO $ putStrLn $ "val " ++ show result
   outRecord <-
     either
       (\e -> error e)
-      (\(_, _, v) -> do
-         let
-           toDecode = jsonToAesonValue v
-           schemaString = getSchemaFromObject toDecode
-           fields =
-             case toDecode of
-               Object o -> HashMap.toList o
-               _ -> [("$", toDecode)]
-           unwrappedForDecode = wrapFromValues False edef toDecode
-           
-         liftIO $ putStrLn $ "wrapFromValues " ++ show schemaString ++ " " ++ show unwrappedForDecode
-         
-         let
-           aboutTo :: Either Text [(Text,Value)] =
-             (\l -> uncurry placeSchemaLetter <$> zip schemaString l) <$> unwrappedForDecode
-           res :: Either Text [(Text,PersistValue)] =
-             rehydrate schemaString =<< unwrappedForDecode
-
-         liftIO $ putStrLn $ "about to " ++ show aboutTo
-         liftIO $ putStrLn $ "got values " ++ show res
-
-         decoded :: Either Text val <-
-           either
-             (\e -> do
-                 liftIO $ putStrLn $ "failed " ++ T.unpack e
-                 pure $ Left e
-             )
-             (\v -> do
-                 liftIO $ putStrLn $ "wrap ok"
-                 pure $ Right v
-             )
-             (fromPersistValues =<< (\l -> snd <$> l) <$> res)
-
-         pure decoded
-      )
+      (\(_, _, v) -> pure $ doPersistDecode edef $ jsonToAesonValue v)
       (CE.note "could not decode as json" result)
   either
     (\e -> do
@@ -538,7 +530,7 @@ instance PersistUniqueRead CouchContext where
     ctx <- ask
     couchDBGetBy ctx k
 
-encodeDocumentBody :: forall record. Text -> [Text] -> [PersistValue] -> [(Text, PersistValue)]
+encodeDocumentBody :: Text -> [Text] -> [PersistValue] -> [(Text, PersistValue)]
 encodeDocumentBody haskellName fields values =
   let
     schema :: (Text, PersistValue) =
