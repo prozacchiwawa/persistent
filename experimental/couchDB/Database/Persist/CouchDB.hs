@@ -18,6 +18,7 @@ module Database.Persist.CouchDB
     ( module Database.Persist
     , withCouchDBConn
     , CouchContext (..)
+    , LowLevelInterface (..)
     , aesonToJSONResult
     , aesonToJSONValue
     , jsonToAesonValue
@@ -28,21 +29,21 @@ module Database.Persist.CouchDB
     , doPersistDecode
     , encodeDocumentBody
     , dehydrate
+    , defaultLowLevelInterface
     ) where
 
 import Database.Persist
 import Database.Persist.Sql hiding (ConnectionPool)
-import Database.Persist.Types
+-- import Database.Persist.Types
 -- import Database.Persist.Store
 -- import Database.Persist.Query.Internal
 
 import qualified Control.Error.Util as CE
 import Control.Monad
-import Control.Monad.Reader
-import Control.Monad.Trans.Reader hiding (ask)
+import Control.Monad.Trans.Reader
 import Control.Monad.IO.Class (MonadIO (..))
-import Control.Monad.Base (MonadBase (liftBase))
-import Control.Monad.Trans.Class (MonadTrans (..))
+-- import Control.Monad.Base (MonadBase (liftBase))
+-- import Control.Monad.Trans.Class (MonadTrans (..))
 import "MonadCatchIO-transformers" Control.Monad.CatchIO
 import Control.Monad.Trans.Control
   ( ComposeSt
@@ -51,10 +52,10 @@ import Control.Monad.Trans.Control
   , MonadBaseControl (..)
   , MonadTransControl (..)
   )
-import Control.Applicative (Applicative)
-import Control.Comonad.Env hiding (ask)
-import Control.Monad.Catch
-import Control.Monad.IO.Unlift
+-- import Control.Applicative (Applicative)
+-- import Control.Comonad.Env hiding (ask)
+-- import Control.Monad.Catch
+-- import Control.Monad.IO.Unlift
 
 import Data.Acquire
 import Data.Aeson
@@ -108,10 +109,16 @@ import Data.Int
 data IDGAFException = IDGAFException String Value deriving (Show, Eq)
 instance Exception IDGAFException
 
+data LowLevelInterface a =
+  LowLevelInterface
+    { putDocument :: a -> DB.Doc -> Value -> IO (Either String DB.Rev)
+    }
+
 data CouchContext =
   CouchContext
     { couchInstanceConn :: DB.CouchConn
     , couchInstanceDB :: DB.DB
+    , couchInterface :: LowLevelInterface CouchContext
     }
 
 data CouchMonadT m a = CouchMonadT (ReaderT CouchContext m a)
@@ -140,6 +147,12 @@ instance FromHttpApiData (BackendKey CouchContext) where
 
 instance PersistFieldSql (BackendKey CouchContext) where
   sqlType _ = sqlType (Proxy :: Proxy Text)
+
+defaultLowLevelInterface =
+  LowLevelInterface
+    { putDocument = \ctx@CouchContext {..} doc encodedJson -> do
+        run couchInstanceConn $ DB.newNamedDoc couchInstanceDB doc $ aesonToJSONValue encodedJson
+    }
 
 -- Actually tried pulling in Data.Either.Extra but doesn't appear to contain mapLeft with the
 -- package set we have
@@ -174,11 +187,11 @@ instance (ToJSON a, FromJSON a) => Text.JSON.JSON a where
   showJSON a = aesonToJSONValue $ toJSON a
   readJSONs (Text.JSON.JSArray v) =
     let
-      (errors, goods) = partitionEithers $ (parseEither parseJSON . jsonToAesonValue) <$> v
+      (errors', goods) = partitionEithers $ (parseEither parseJSON . jsonToAesonValue) <$> v
     in
-    case (errors, goods) of
+    case (errors', goods) of
       ([], good) -> Text.JSON.Ok good
-      (errors, _) -> Text.JSON.Error $ intercalate ";" errors
+      (errors'', _) -> Text.JSON.Error $ intercalate ";" errors''
   readJSONs x = Text.JSON.Error "need an array"
   showJSONs xs = Text.JSON.JSArray $ (aesonToJSONValue . toJSON) <$> xs
 
@@ -586,9 +599,8 @@ couchDBInsertKey ctx@CouchContext {..} key record = do
 
   liftIO $ putStrLn $ "baseFields " ++ (show baseFields)
   liftIO $ putStrLn $ "encodedJSON " ++ (show encodedJson)
-  
-  docInsertResult :: Either String DB.Rev <-
-    run couchInstanceConn $ DB.newNamedDoc couchInstanceDB doc $ aesonToJSONValue encodedJson
+
+  liftIO $ (putDocument couchInterface) ctx doc encodedJson
 
   pure key
 {-
@@ -606,8 +618,8 @@ instance PersistStoreWrite CouchContext where
   insert_ record = do
     _ <- insert record
     pure ()
-  insertMany = insertMany
-  insertMany_ = insertMany_
+  insertMany = traverse insert
+  insertMany_ = void . insertMany
   insertEntityMany = insertEntityMany
   insertKey k record = do
     ctx <- ask
@@ -656,8 +668,9 @@ withCouchDBConn
   => String -- ^ database name
   -> String -- ^ host name (typically \"localhost\")
   -> Int    -- ^ port number (typically 5984)
+  -> LowLevelInterface CouchContext -- ^ alternate record put/get
   -> (CouchContext -> m b) -> m b
-withCouchDBConn db host port fn = do
+withCouchDBConn db host port lli fn = do
   conn <- open
   res <- fn conn
   close conn
@@ -668,7 +681,7 @@ withCouchDBConn db host port fn = do
       conn <- liftIO $ DB.createCouchConn host port
       liftIO $ E.catch (run conn $ DB.createDB db)
         (\(E.ErrorCall _) -> return ())
-      return $ CouchContext conn $ DB.db db
+      return $ CouchContext conn (DB.db db) lli
 
     close = liftIO . DB.closeCouchConn . couchInstanceConn
 
