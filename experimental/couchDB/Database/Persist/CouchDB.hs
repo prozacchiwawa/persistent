@@ -92,6 +92,7 @@ import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as BL
 -- import qualified Data.Enumerator.List as EL
 import qualified Database.CouchDB as DB
+import qualified Database.Persist.B64 as D64
 import qualified Control.Exception.Base as E
 import Data.Aeson (Value (Object, Number), (.:), (.:?), (.!=), FromJSON(..))
 import Data.Aeson.Types
@@ -244,11 +245,14 @@ getSchemaLetter (PersistDbSpecific _) = 'p'
 makeSchemaString :: [PersistValue] -> String
 makeSchemaString pv = getSchemaLetter <$> pv
 
+b64encode :: BS.ByteString -> Text
+b64encode = decodeUtf8 . BS.pack . D64.encode . BS.unpack
+
 dehydrate :: PersistValue -> Value
 dehydrate (PersistText t) = String $ t
-dehydrate (PersistByteString bs) = String $ (T.pack "b") <> decodeUtf8 (B64.encode bs)
-dehydrate (PersistObjectId i) = String $ (T.pack "o") <> decodeUtf8 (B64.encode i)
-dehydrate (PersistDbSpecific s) = String $ (T.pack "p") <> decodeUtf8 (B64.encode s)
+dehydrate (PersistByteString bs) = String $ (T.pack "b") <> b64encode bs
+dehydrate (PersistObjectId i) = String $ (T.pack "o") <> b64encode i
+dehydrate (PersistDbSpecific s) = String $ (T.pack "p") <> b64encode s
 dehydrate (PersistRational r) = Number $ fromRational r
 dehydrate (PersistList l) = Array $ Vector.fromList $ dehydrate <$> l
 dehydrate (PersistMap m) = Object $ HashMap.fromList $ (\(k,v) -> (k,dehydrate v)) <$> m
